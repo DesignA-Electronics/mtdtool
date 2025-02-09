@@ -524,7 +524,7 @@ static int do_write_raw(char *device_name, char *filename, uint64_t offset)
     int retval = 0;
     char *buffer = NULL, *oob_buffer = NULL;
     int blocksize, oobsize, pagesize;
-    file_info file;
+    file_info file = {0};
 
     mtd = mtd_new_auto(device_name, 0);
     if (!mtd) {

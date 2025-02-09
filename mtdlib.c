@@ -13,7 +13,9 @@
  * ======================================================================
  */
 
+#ifndef _LARGEFILE64_SOURCE
 #define _LARGEFILE64_SOURCE
+#endif
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
@@ -437,7 +439,7 @@ mtd_info *mtd_new_auto(const char *name, int readonly)
 
     if (strncmp("mtd", name, 3) == 0) {
         char filename[64];
-        sprintf(filename, "/dev/%s", name);
+        snprintf(filename, sizeof(filename), "/dev/%s", name);
         return mtd_new_filename(filename, readonly);
     }
 
