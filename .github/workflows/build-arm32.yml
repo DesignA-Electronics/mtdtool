@@ -1,0 +1,32 @@
+name: Build ARM32 (musl)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-arm32-musl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Build mtdtool for ARM32 (musl)
+        run: |
+          make mtdtool \
+            CC="zig cc -target arm-linux-musleabihf" \
+            CLANG_FORMAT=true \
+            CFLAGS="-Wall -O2 -pipe"
+
+      - name: Verify target architecture
+        run: file mtdtool
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mtdtool-arm32-musl
+          path: mtdtool
