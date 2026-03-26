@@ -42,14 +42,6 @@
         _x > _y ? _x : _y;                                                   \
     })
 
-#define SNAPPER // means we can have the extra mtd support we need to do extra
-                // stuff
-
-#ifdef SNAPPER
-#define PROC_FILE "/proc/snapper/mtd"
-//#define PROC_FILE "/proc/raid_mtd"
-#endif
-
 enum {
     CMD_INFO,
     CMD_INFO_SCAN,
@@ -67,6 +59,7 @@ enum {
     CMD_UNLOCK,
     CMD_LOCK,
     CMD_REWRITE,
+    CMD_STRESS,
 
     CMD_UNKNOWN,
 };
@@ -75,36 +68,81 @@ static int bad_block_skipping = 1;
 
 static void usage(char *program)
 {
-    fprintf(stderr, "%s - (%s %s)\n", program, __DATE__, __TIME__);
-    fprintf(
-        stderr,
-        "Usage: %s [options] [args]\n"
-        "	options:\n"
-        "          --ignore_bad Allow reading/writing of bad blocks (may "
-        "fail)\n"
-        "	args:\n"
-        "          --help Show this info\n"
-        "          --info Show information about this device\n"
-        "          --info_scan Show information about this device, and "
-        "manually scan for bad blocks\n"
-        "          --erase device offset length\n"
-        "          --eraseall device\n"
-        "          --quick_erase device - Only erase blocks that are in use "
-        "(may not be 100%% accurate)\n"
-        "          --write device filename [offset]\n"
-        "          --rewrite device filename [offset]\n"
-        "          --read device filename length [offset]\n"
-        "          --read_raw device filename [length]\n"
-        "          --read_raw_skip device filename [length]\n"
-        "          --write_raw device filename [offset]\n"
-        "          --verify device filename [offset]\n"
-        "          --dump device offset [page count] Dump the hex output of "
-        "the page starting at offset, including its oob. Defaults to a page "
-        "count of 1\n"
-        "          --markbad device offset - forcibly mark a block as bad\n"
-        "          --unlock device [offset length]\n"
-        "          --lock device offset length\n",
-        program);
+    fprintf(stderr,
+            "Usage: %s [options] <command> [args]\n"
+            "\n"
+            "Options:\n"
+            "  --ignore_bad            Allow reading/writing of bad blocks "
+            "(may fail)\n"
+            "\n"
+            "Commands:\n"
+            "  --help\n"
+            "      Show this help\n"
+            "\n"
+            "  --info <device>\n"
+            "      Show information about the MTD partition\n"
+            "\n"
+            "  --info_scan <device>\n"
+            "      Show information about the MTD partition, manually "
+            "scanning for bad blocks\n"
+            "\n"
+            "  --erase <device> <offset> <length>\n"
+            "      Erase a region of the partition\n"
+            "\n"
+            "  --force_erase <device> <offset> <length>\n"
+            "      Erase a region, skipping bad-block checks\n"
+            "\n"
+            "  --eraseall <device>\n"
+            "      Erase the entire partition\n"
+            "\n"
+            "  --force_eraseall <device>\n"
+            "      Erase the entire partition, skipping bad-block checks\n"
+            "\n"
+            "  --quick_erase <device>\n"
+            "      Erase only blocks that appear to be in use (may not be "
+            "100%% accurate)\n"
+            "\n"
+            "  --write <device> <filename> [offset]\n"
+            "      Erase and write a file to the partition\n"
+            "\n"
+            "  --write_raw <device> <filename> [offset]\n"
+            "      Write a raw file (interleaved page+OOB data) to the "
+            "partition\n"
+            "\n"
+            "  --read <device> <filename> <length> [offset]\n"
+            "      Read data from the partition into a file\n"
+            "\n"
+            "  --read_raw <device> <filename> [length]\n"
+            "      Read raw page+OOB data from the partition into a file\n"
+            "\n"
+            "  --read_raw_skip <device> <filename> [length]\n"
+            "      Read raw page+OOB data, skipping fully-erased pages\n"
+            "\n"
+            "  --verify <device> <filename> [offset]\n"
+            "      Verify that a file matches the contents of the partition\n"
+            "\n"
+            "  --rewrite <device> <filename> [offset]\n"
+            "      Erase, write, then verify a file on the partition\n"
+            "\n"
+            "  --dump <device> <offset> [page_count]\n"
+            "      Hex-dump pages including OOB starting at offset (default: "
+            "1 page)\n"
+            "\n"
+            "  --markbad <device> <offset>\n"
+            "      Forcibly mark the block at offset as bad\n"
+            "\n"
+            "  --unlock <device> [offset length]\n"
+            "      Unlock the partition, or a region within it\n"
+            "\n"
+            "  --lock <device> <offset> <length>\n"
+            "      Lock a region of the partition\n"
+            "\n"
+            "  --stress <device> <seconds>\n"
+            "      Stress test: erase the entire partition, then randomly "
+            "write and read\n"
+            "      back blocks using per-block random seeds, reporting any "
+            "errors\n",
+            program);
 }
 
 static unsigned int get_msec(void)
@@ -1134,6 +1172,182 @@ static int do_mark_bad(char *device_name, uint64_t offset)
     return 0;
 }
 
+/* Fill a buffer with deterministic pseudo-random data derived from a seed.
+ * The same seed always produces the same pattern, allowing read-back
+ * verification. A seed of 0 is reserved to mean "erased". */
+static void fill_block_from_seed(char *buf, int size, uint32_t seed)
+{
+    uint32_t state = seed;
+    int i;
+
+    for (i = 0; i < size; i++) {
+        state = state * 1664525u + 1013904223u; /* Knuth LCG */
+        buf[i] = (char)((state >> 16) & 0xff);
+    }
+}
+
+static int do_stress(char *device_name, int seconds)
+{
+    mtd_info *mtd = NULL;
+    uint32_t *block_seeds = NULL; /* per-block seed; 0 means erased */
+    char *block_buf = NULL;
+    char *expected_buf = NULL;
+    int retval = 0;
+    unsigned int blocksize, block_count;
+    int read_errors = 0, write_errors = 0, erase_errors = 0;
+    time_t end_time;
+    uint64_t iterations = 0;
+    uint32_t block_idx, seed;
+    uint64_t block_offset;
+    int remaining;
+    uint64_t read_bytes = 0, write_bytes = 0, erase_bytes = 0;
+    unsigned int read_ms = 0, write_ms = 0, erase_ms = 0;
+    unsigned int op_start, elapsed_ms, start_ms;
+
+    mtd = mtd_new_auto(device_name, 0);
+    if (!mtd)
+        return -1;
+
+    blocksize = mtd_blocksize(mtd);
+    block_count = mtd_blockcount(mtd);
+
+    block_seeds = calloc(block_count, sizeof(uint32_t));
+    block_buf = malloc(blocksize);
+    expected_buf = malloc(blocksize);
+    if (!block_seeds || !block_buf || !expected_buf) {
+        fprintf(stderr, "Unable to allocate memory: %s\n", strerror(errno));
+        retval = -1;
+        goto done;
+    }
+
+    srand((unsigned int)time(NULL));
+
+    printf("Erasing entire partition %s...\n", device_name);
+    if (erase_mtd(mtd, 0, mtd_size(mtd), 0) < 0) {
+        fprintf(stderr, "Failed to erase partition\n");
+        retval = -1;
+        goto done;
+    }
+    /* block_seeds already all-zero from calloc, matching erased state */
+
+    end_time = time(NULL) + seconds;
+    start_ms = get_msec();
+    printf("Starting stress test for %d seconds on %s "
+           "(%u blocks of %u bytes each)...\n",
+           seconds, device_name, block_count, blocksize);
+
+    while (time(NULL) < end_time) {
+        block_idx = (uint32_t)((unsigned int)rand() % block_count);
+        block_offset = (uint64_t)block_idx * blocksize;
+
+        if (mtd_block_is_bad(mtd, block_offset))
+            continue;
+
+        if (rand() & 1) {
+            /* WRITE: erase block, then write with a fresh seed */
+            op_start = get_msec();
+            if (mtd_blocks_erase(mtd, block_offset, 1) < 0) {
+                fprintf(stderr, "Erase error at block 0x%" PRIx64 ": %s\n",
+                        block_offset, mtd_strerror(mtd));
+                erase_errors++;
+                continue;
+            }
+            erase_ms += get_msec() - op_start;
+            erase_bytes += blocksize;
+            block_seeds[block_idx] = 0;
+
+            do {
+                seed = (uint32_t)rand();
+            } while (seed == 0);
+            fill_block_from_seed(block_buf, blocksize, seed);
+
+            mtd_lseek(mtd, block_offset, SEEK_SET);
+            op_start = get_msec();
+            if (mtd_write(mtd, block_buf, blocksize) != blocksize) {
+                fprintf(stderr, "Write error at block 0x%" PRIx64 ": %s\n",
+                        block_offset, mtd_strerror(mtd));
+                write_errors++;
+                continue;
+            }
+            write_ms += get_msec() - op_start;
+            write_bytes += blocksize;
+            block_seeds[block_idx] = seed;
+
+        } else {
+            if (block_seeds[block_idx] == 0) {
+                memset(expected_buf, 0xff, blocksize);
+            } else {
+                fill_block_from_seed(expected_buf, blocksize,
+                                     block_seeds[block_idx]);
+            }
+
+            mtd_lseek(mtd, block_offset, SEEK_SET);
+            op_start = get_msec();
+            if (mtd_read(mtd, block_buf, blocksize) < 0) {
+                fprintf(stderr, "Read error at block 0x%" PRIx64 ": %s\n",
+                        block_offset, mtd_strerror(mtd));
+                read_errors++;
+                continue;
+            }
+            read_ms += get_msec() - op_start;
+            read_bytes += blocksize;
+
+            if (memcmp(block_buf, expected_buf, blocksize) != 0) {
+                fprintf(stderr,
+                        "Data mismatch at block 0x%" PRIx64
+                        " (seed 0x%08" PRIx32 ")\n",
+                        block_offset, block_seeds[block_idx]);
+                read_errors++;
+            }
+        }
+
+        iterations++;
+        if (iterations % 100 == 0) {
+            remaining = (int)(end_time - time(NULL));
+            printf("\r%ds remaining, %" PRIu64 " iters, "
+                   "W:%" PRIu64 "kB@%" PRIu64 "kB/s "
+                   "R:%" PRIu64 "kB@%" PRIu64 "kB/s "
+                   "E:%" PRIu64 "kB@%" PRIu64 "kB/s "
+                   "errs W:%d R:%d E:%d   ",
+                   remaining > 0 ? remaining : 0, iterations,
+                   write_bytes / 1024,
+                   write_ms ? (write_bytes * 1000) / (1024 * write_ms) : 0,
+                   read_bytes / 1024,
+                   read_ms ? (read_bytes * 1000) / (1024 * read_ms) : 0,
+                   erase_bytes / 1024,
+                   erase_ms ? (erase_bytes * 1000) / (1024 * erase_ms) : 0,
+                   write_errors, read_errors, erase_errors);
+            fflush(stdout);
+        }
+    }
+
+    elapsed_ms = get_msec() - start_ms;
+    printf("\nStress test complete: %" PRIu64 " iterations in %u ms\n",
+           iterations, elapsed_ms);
+    printf("  Written: %" PRIu64 " kB @ %" PRIu64 " kB/s\n",
+           write_bytes / 1024,
+           write_ms ? (write_bytes * 1000) / (1024 * write_ms) : 0);
+    printf("  Read:    %" PRIu64 " kB @ %" PRIu64 " kB/s\n",
+           read_bytes / 1024,
+           read_ms ? (read_bytes * 1000) / (1024 * read_ms) : 0);
+    printf("  Erased:  %" PRIu64 " kB @ %" PRIu64 " kB/s\n",
+           erase_bytes / 1024,
+           erase_ms ? (erase_bytes * 1000) / (1024 * erase_ms) : 0);
+    printf("  Write errors: %d\n", write_errors);
+    printf("  Read errors:  %d\n", read_errors);
+    printf("  Erase errors: %d\n", erase_errors);
+
+    retval = (read_errors || write_errors || erase_errors) ? -1 : 0;
+
+done:
+    free(block_seeds);
+    free(block_buf);
+    free(expected_buf);
+    if (mtd)
+        mtd_dispose(mtd);
+    return retval;
+}
+
 int main(int argc, char *argv[])
 {
     int cmd = CMD_UNKNOWN;
@@ -1287,6 +1501,11 @@ int main(int argc, char *argv[])
             } else
                 offset = 0;
             i += 2;
+        } else if (strcmp(argv[i], "--stress") == 0 && i + 2 < argc) {
+            cmd = CMD_STRESS;
+            device = argv[i + 1];
+            length = strtoull(argv[i + 2], NULL, 0);
+            i += 2;
         }
 
         i++;
@@ -1369,6 +1588,10 @@ int main(int argc, char *argv[])
             printf("Verifying %s\n", filename);
             retval = do_verify(device, filename, offset);
         }
+        break;
+
+    case CMD_STRESS:
+        retval = do_stress(device, (int)length);
         break;
 
     default:
