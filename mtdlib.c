@@ -36,6 +36,12 @@
 
 #include <unistd.h>
 
+/* musl does not expose loff_t; define it portably */
+#ifndef __loff_t_defined
+typedef long long loff_t;
+#define __loff_t_defined
+#endif
+
 #include "mtd/mtd-user.h"
 #include "mtdlib.h"
 
