@@ -36,8 +36,9 @@
 
 #include <unistd.h>
 
-/* musl does not expose loff_t; define it portably */
-#ifndef __loff_t_defined
+/* musl does not expose loff_t; define it portably (glibc provides it via
+ * sys/types.h but does not set __loff_t_defined) */
+#if !defined(__loff_t_defined) && !defined(__GLIBC__)
 typedef long long loff_t;
 #define __loff_t_defined
 #endif

@@ -1,5 +1,5 @@
 CFLAGS = -Wall -g -pipe -O2
-LFLAGS =
+LFLAGS = -lpthread
 SOURCES=mtdtool.c mtdlib.c
 OBJECTS=$(SOURCES:.c=.o)
 CLANG_FORMAT?=clang-format

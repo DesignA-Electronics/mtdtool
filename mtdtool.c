@@ -16,6 +16,8 @@
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -159,7 +161,7 @@ does it */
 static char *util_bytes_to_user(char *buff, uint64_t bytes)
 {
     if (bytes < 0x1000)
-        sprintf(buff, "%4" PRId64 " ", bytes);
+        sprintf(buff, "%4" PRId64, bytes);
     else {
         bytes = (bytes + 512) >> 10;
         if (bytes < 0x1000)
@@ -181,7 +183,7 @@ static char *util_bytes_to_userf(char *buff, uint64_t b)
     double bytes = b;
 
     if (bytes < 0x1000)
-        sprintf(buff, "%4.0lf ", bytes);
+        sprintf(buff, "%4.0lf", bytes);
     else {
         bytes /= 1024;
         if (bytes < 0x1000)
@@ -1172,6 +1174,30 @@ static int do_mark_bad(char *device_name, uint64_t offset)
     return 0;
 }
 
+#define STRESS_THREADS 4
+
+/* Shared state between all stress threads */
+typedef struct {
+    pthread_mutex_t lock;
+    uint32_t *block_seeds; /* per-block seed; 0 = erased */
+    uint8_t *inuse;        /* non-zero while a thread is operating on block */
+    unsigned int blocksize;
+    unsigned int block_count;
+    char *device_name;
+    time_t end_time;
+    /* Atomically-updated counters written by threads, read by main */
+    atomic_uintmax_t iterations;
+    atomic_uintmax_t read_bytes, write_bytes, erase_bytes;
+    atomic_uintmax_t read_ms, write_ms, erase_ms;
+    atomic_uintmax_t read_errors, write_errors, erase_errors;
+} stress_shared;
+
+/* Per-thread arguments */
+typedef struct {
+    stress_shared *shared;
+    int thread_id;
+} stress_thread_args;
+
 /* Fill a buffer with deterministic pseudo-random data derived from a seed.
  * The same seed always produces the same pattern, allowing read-back
  * verification. A seed of 0 is reserved to mean "erased". */
@@ -1186,41 +1212,185 @@ static void fill_block_from_seed(char *buf, int size, uint32_t seed)
     }
 }
 
+static void *stress_thread(void *arg)
+{
+    stress_thread_args *ta = arg;
+    stress_shared *sh = ta->shared;
+    unsigned int blocksize = sh->blocksize;
+    mtd_info *mtd = NULL;
+    char *block_buf = NULL;
+    char *expected_buf = NULL;
+    /* Per-thread rand state to avoid locking rand's global seed */
+    unsigned int rand_state =
+        (unsigned int)(time(NULL) ^
+                       ((unsigned int)ta->thread_id * 2654435761u));
+
+    mtd = mtd_new_auto(sh->device_name, 0);
+    if (!mtd) {
+        fprintf(stderr, "Thread %d: unable to open %s\n", ta->thread_id,
+                sh->device_name);
+        return NULL;
+    }
+
+    block_buf = malloc(blocksize);
+    expected_buf = malloc(blocksize);
+    if (!block_buf || !expected_buf) {
+        fprintf(stderr, "Thread %d: unable to allocate buffers\n",
+                ta->thread_id);
+        goto done;
+    }
+
+    while (time(NULL) < sh->end_time) {
+        uint32_t block_idx =
+            (uint32_t)(rand_r(&rand_state) % sh->block_count);
+        uint64_t block_offset = (uint64_t)block_idx * blocksize;
+        uint32_t seed;
+        unsigned int op_start;
+        int do_write;
+
+        if (mtd_block_is_bad(mtd, block_offset))
+            continue;
+
+        /* Claim the block; skip if another thread is already using it */
+        pthread_mutex_lock(&sh->lock);
+        if (sh->inuse[block_idx]) {
+            pthread_mutex_unlock(&sh->lock);
+            continue;
+        }
+        sh->inuse[block_idx] = 1;
+        seed = sh->block_seeds[block_idx];
+        do_write = rand_r(&rand_state) & 1;
+        pthread_mutex_unlock(&sh->lock);
+
+        if (do_write) {
+            /* WRITE: erase block, then write with a fresh seed */
+            uint32_t new_seed;
+
+            op_start = get_msec();
+            if (mtd_blocks_erase(mtd, block_offset, 1) < 0) {
+                fprintf(stderr, "Erase error at block 0x%" PRIx64 ": %s\n",
+                        block_offset, mtd_strerror(mtd));
+                atomic_fetch_add(&sh->erase_errors, 1);
+                pthread_mutex_lock(&sh->lock);
+                sh->inuse[block_idx] = 0;
+                pthread_mutex_unlock(&sh->lock);
+                continue;
+            }
+            atomic_fetch_add(&sh->erase_ms, get_msec() - op_start);
+            atomic_fetch_add(&sh->erase_bytes, blocksize);
+
+            do {
+                new_seed = (uint32_t)rand_r(&rand_state);
+            } while (new_seed == 0);
+            fill_block_from_seed(block_buf, blocksize, new_seed);
+
+            mtd_lseek(mtd, block_offset, SEEK_SET);
+            op_start = get_msec();
+            if (mtd_write(mtd, block_buf, blocksize) != (int)blocksize) {
+                fprintf(stderr, "Write error at block 0x%" PRIx64 ": %s\n",
+                        block_offset, mtd_strerror(mtd));
+                atomic_fetch_add(&sh->write_errors, 1);
+                /* Leave seed as 0 (erased) after a failed write */
+                pthread_mutex_lock(&sh->lock);
+                sh->block_seeds[block_idx] = 0;
+                sh->inuse[block_idx] = 0;
+                pthread_mutex_unlock(&sh->lock);
+                continue;
+            }
+            atomic_fetch_add(&sh->write_ms, get_msec() - op_start);
+            atomic_fetch_add(&sh->write_bytes, blocksize);
+
+            pthread_mutex_lock(&sh->lock);
+            sh->block_seeds[block_idx] = new_seed;
+            sh->inuse[block_idx] = 0;
+            pthread_mutex_unlock(&sh->lock);
+
+        } else {
+            /* READ: read back and verify against expected pattern */
+            if (seed == 0)
+                memset(expected_buf, 0xff, blocksize);
+            else
+                fill_block_from_seed(expected_buf, blocksize, seed);
+
+            mtd_lseek(mtd, block_offset, SEEK_SET);
+            op_start = get_msec();
+            if (mtd_read(mtd, block_buf, blocksize) < 0) {
+                fprintf(stderr, "Read error at block 0x%" PRIx64 ": %s\n",
+                        block_offset, mtd_strerror(mtd));
+                atomic_fetch_add(&sh->read_errors, 1);
+                pthread_mutex_lock(&sh->lock);
+                sh->inuse[block_idx] = 0;
+                pthread_mutex_unlock(&sh->lock);
+                continue;
+            }
+            atomic_fetch_add(&sh->read_ms, get_msec() - op_start);
+            atomic_fetch_add(&sh->read_bytes, blocksize);
+
+            if (memcmp(block_buf, expected_buf, blocksize) != 0) {
+                fprintf(stderr,
+                        "Data mismatch at block 0x%" PRIx64
+                        " (seed 0x%08" PRIx32 ")\n",
+                        block_offset, seed);
+                atomic_fetch_add(&sh->read_errors, 1);
+            }
+
+            pthread_mutex_lock(&sh->lock);
+            sh->inuse[block_idx] = 0;
+            pthread_mutex_unlock(&sh->lock);
+        }
+
+        atomic_fetch_add(&sh->iterations, 1);
+    }
+
+done:
+    free(block_buf);
+    free(expected_buf);
+    if (mtd)
+        mtd_dispose(mtd);
+    return NULL;
+}
+
 static int do_stress(char *device_name, int seconds)
 {
     mtd_info *mtd = NULL;
-    uint32_t *block_seeds = NULL; /* per-block seed; 0 means erased */
-    char *block_buf = NULL;
-    char *expected_buf = NULL;
+    stress_shared shared;
+    stress_thread_args thread_args[STRESS_THREADS];
+    pthread_t threads[STRESS_THREADS];
+    int threads_started = 0;
     int retval = 0;
-    unsigned int blocksize, block_count;
-    int read_errors = 0, write_errors = 0, erase_errors = 0;
-    time_t end_time;
-    uint64_t iterations = 0;
-    uint32_t block_idx, seed;
-    uint64_t block_offset;
-    int remaining;
-    uint64_t read_bytes = 0, write_bytes = 0, erase_bytes = 0;
-    unsigned int read_ms = 0, write_ms = 0, erase_ms = 0;
-    unsigned int op_start, elapsed_ms, start_ms;
+    int i;
+    unsigned int start_ms, elapsed_ms;
+    unsigned int last_print_ms;
+
+    memset(&shared, 0, sizeof(shared));
+    memset(thread_args, 0, sizeof(thread_args));
+    atomic_init(&shared.iterations, 0);
+    atomic_init(&shared.read_bytes, 0);
+    atomic_init(&shared.write_bytes, 0);
+    atomic_init(&shared.erase_bytes, 0);
+    atomic_init(&shared.read_ms, 0);
+    atomic_init(&shared.write_ms, 0);
+    atomic_init(&shared.erase_ms, 0);
+    atomic_init(&shared.read_errors, 0);
+    atomic_init(&shared.write_errors, 0);
+    atomic_init(&shared.erase_errors, 0);
 
     mtd = mtd_new_auto(device_name, 0);
     if (!mtd)
         return -1;
 
-    blocksize = mtd_blocksize(mtd);
-    block_count = mtd_blockcount(mtd);
+    shared.blocksize = mtd_blocksize(mtd);
+    shared.block_count = mtd_blockcount(mtd);
+    shared.device_name = device_name;
 
-    block_seeds = calloc(block_count, sizeof(uint32_t));
-    block_buf = malloc(blocksize);
-    expected_buf = malloc(blocksize);
-    if (!block_seeds || !block_buf || !expected_buf) {
+    shared.block_seeds = calloc(shared.block_count, sizeof(uint32_t));
+    shared.inuse = calloc(shared.block_count, sizeof(uint8_t));
+    if (!shared.block_seeds || !shared.inuse) {
         fprintf(stderr, "Unable to allocate memory: %s\n", strerror(errno));
         retval = -1;
         goto done;
     }
-
-    srand((unsigned int)time(NULL));
+    pthread_mutex_init(&shared.lock, NULL);
 
     printf("Erasing entire partition %s...\n", device_name);
     if (erase_mtd(mtd, 0, mtd_size(mtd), 0) < 0) {
@@ -1230,119 +1400,104 @@ static int do_stress(char *device_name, int seconds)
     }
     /* block_seeds already all-zero from calloc, matching erased state */
 
-    end_time = time(NULL) + seconds;
+    /* Close the mtd handle before threads open their own */
+    mtd_dispose(mtd);
+    mtd = NULL;
+
+    shared.end_time = time(NULL) + seconds;
     start_ms = get_msec();
     printf("Starting stress test for %d seconds on %s "
-           "(%u blocks of %u bytes each)...\n",
-           seconds, device_name, block_count, blocksize);
+           "(%u blocks of %u bytes each) with %d threads...\n",
+           seconds, device_name, shared.block_count, shared.blocksize,
+           STRESS_THREADS);
 
-    while (time(NULL) < end_time) {
-        block_idx = (uint32_t)((unsigned int)rand() % block_count);
-        block_offset = (uint64_t)block_idx * blocksize;
-
-        if (mtd_block_is_bad(mtd, block_offset))
-            continue;
-
-        if (rand() & 1) {
-            /* WRITE: erase block, then write with a fresh seed */
-            op_start = get_msec();
-            if (mtd_blocks_erase(mtd, block_offset, 1) < 0) {
-                fprintf(stderr, "Erase error at block 0x%" PRIx64 ": %s\n",
-                        block_offset, mtd_strerror(mtd));
-                erase_errors++;
-                continue;
-            }
-            erase_ms += get_msec() - op_start;
-            erase_bytes += blocksize;
-            block_seeds[block_idx] = 0;
-
-            do {
-                seed = (uint32_t)rand();
-            } while (seed == 0);
-            fill_block_from_seed(block_buf, blocksize, seed);
-
-            mtd_lseek(mtd, block_offset, SEEK_SET);
-            op_start = get_msec();
-            if (mtd_write(mtd, block_buf, blocksize) != blocksize) {
-                fprintf(stderr, "Write error at block 0x%" PRIx64 ": %s\n",
-                        block_offset, mtd_strerror(mtd));
-                write_errors++;
-                continue;
-            }
-            write_ms += get_msec() - op_start;
-            write_bytes += blocksize;
-            block_seeds[block_idx] = seed;
-
-        } else {
-            if (block_seeds[block_idx] == 0) {
-                memset(expected_buf, 0xff, blocksize);
-            } else {
-                fill_block_from_seed(expected_buf, blocksize,
-                                     block_seeds[block_idx]);
-            }
-
-            mtd_lseek(mtd, block_offset, SEEK_SET);
-            op_start = get_msec();
-            if (mtd_read(mtd, block_buf, blocksize) < 0) {
-                fprintf(stderr, "Read error at block 0x%" PRIx64 ": %s\n",
-                        block_offset, mtd_strerror(mtd));
-                read_errors++;
-                continue;
-            }
-            read_ms += get_msec() - op_start;
-            read_bytes += blocksize;
-
-            if (memcmp(block_buf, expected_buf, blocksize) != 0) {
-                fprintf(stderr,
-                        "Data mismatch at block 0x%" PRIx64
-                        " (seed 0x%08" PRIx32 ")\n",
-                        block_offset, block_seeds[block_idx]);
-                read_errors++;
-            }
+    for (i = 0; i < STRESS_THREADS; i++) {
+        thread_args[i].shared = &shared;
+        thread_args[i].thread_id = i;
+        if (pthread_create(&threads[i], NULL, stress_thread,
+                           &thread_args[i]) != 0) {
+            fprintf(stderr, "Failed to create thread %d: %s\n", i,
+                    strerror(errno));
+            shared.end_time = time(NULL); /* tell running threads to stop */
+            break;
         }
-
-        iterations++;
-        if (iterations % 100 == 0) {
-            remaining = (int)(end_time - time(NULL));
-            printf("\r%ds remaining, %" PRIu64 " iters, "
-                   "W:%" PRIu64 "kB@%" PRIu64 "kB/s "
-                   "R:%" PRIu64 "kB@%" PRIu64 "kB/s "
-                   "E:%" PRIu64 "kB@%" PRIu64 "kB/s "
-                   "errs W:%d R:%d E:%d   ",
-                   remaining > 0 ? remaining : 0, iterations,
-                   write_bytes / 1024,
-                   write_ms ? (write_bytes * 1000) / (1024 * write_ms) : 0,
-                   read_bytes / 1024,
-                   read_ms ? (read_bytes * 1000) / (1024 * read_ms) : 0,
-                   erase_bytes / 1024,
-                   erase_ms ? (erase_bytes * 1000) / (1024 * erase_ms) : 0,
-                   write_errors, read_errors, erase_errors);
-            fflush(stdout);
-        }
+        threads_started++;
     }
 
-    elapsed_ms = get_msec() - start_ms;
-    printf("\nStress test complete: %" PRIu64 " iterations in %u ms\n",
-           iterations, elapsed_ms);
-    printf("  Written: %" PRIu64 " kB @ %" PRIu64 " kB/s\n",
-           write_bytes / 1024,
-           write_ms ? (write_bytes * 1000) / (1024 * write_ms) : 0);
-    printf("  Read:    %" PRIu64 " kB @ %" PRIu64 " kB/s\n",
-           read_bytes / 1024,
-           read_ms ? (read_bytes * 1000) / (1024 * read_ms) : 0);
-    printf("  Erased:  %" PRIu64 " kB @ %" PRIu64 " kB/s\n",
-           erase_bytes / 1024,
-           erase_ms ? (erase_bytes * 1000) / (1024 * erase_ms) : 0);
-    printf("  Write errors: %d\n", write_errors);
-    printf("  Read errors:  %d\n", read_errors);
-    printf("  Erase errors: %d\n", erase_errors);
+    /* Print progress every 10 s while threads are running */
+    last_print_ms = 0;
+    while (time(NULL) < shared.end_time) {
+        sleep(1);
+        if (get_msec() - start_ms < last_print_ms + 10000)
+            continue;
+        last_print_ms = get_msec() - start_ms;
 
-    retval = (read_errors || write_errors || erase_errors) ? -1 : 0;
+        {
+            uintmax_t iters = atomic_load(&shared.iterations);
+            uintmax_t wb = atomic_load(&shared.write_bytes);
+            uintmax_t wms = atomic_load(&shared.write_ms);
+            uintmax_t rb = atomic_load(&shared.read_bytes);
+            uintmax_t rms = atomic_load(&shared.read_ms);
+            uintmax_t eb = atomic_load(&shared.erase_bytes);
+            uintmax_t ems = atomic_load(&shared.erase_ms);
+            uintmax_t we = atomic_load(&shared.write_errors);
+            uintmax_t re = atomic_load(&shared.read_errors);
+            uintmax_t ee = atomic_load(&shared.erase_errors);
+            char ws[20], wrs[20], rs[20], rrs[20], es[20], ers[20];
+            util_bytes_to_user(ws, wb);
+            util_bytes_to_userf(wrs, wms ? (double)(wb * 1000) / wms : 0);
+            util_bytes_to_user(rs, rb);
+            util_bytes_to_userf(rrs, rms ? (double)(rb * 1000) / rms : 0);
+            util_bytes_to_user(es, eb);
+            util_bytes_to_userf(ers, ems ? (double)(eb * 1000) / ems : 0);
+            printf("\r%ds remaining, %" PRIuMAX " iters, "
+                   "W:%s@%s/s R:%s@%s/s E:%s@%s/s "
+                   "errs W:%" PRIuMAX " R:%" PRIuMAX " E:%" PRIuMAX "   ",
+                   (int)(shared.end_time - time(NULL)), iters, ws, wrs, rs,
+                   rrs, es, ers, we, re, ee);
+        }
+        fflush(stdout);
+    }
+
+    for (i = 0; i < threads_started; i++)
+        pthread_join(threads[i], NULL);
+
+    elapsed_ms = get_msec() - start_ms;
+    {
+        uintmax_t iters = atomic_load(&shared.iterations);
+        uintmax_t wb = atomic_load(&shared.write_bytes);
+        uintmax_t wms = atomic_load(&shared.write_ms);
+        uintmax_t rb = atomic_load(&shared.read_bytes);
+        uintmax_t rms = atomic_load(&shared.read_ms);
+        uintmax_t eb = atomic_load(&shared.erase_bytes);
+        uintmax_t ems = atomic_load(&shared.erase_ms);
+        uintmax_t we = atomic_load(&shared.write_errors);
+        uintmax_t re = atomic_load(&shared.read_errors);
+        uintmax_t ee = atomic_load(&shared.erase_errors);
+        char ws[20], wrs[20], rs[20], rrs[20], es[20], ers[20];
+
+        util_bytes_to_user(ws, wb);
+        util_bytes_to_userf(wrs, wms ? (double)(wb * 1000) / wms : 0);
+        util_bytes_to_user(rs, rb);
+        util_bytes_to_userf(rrs, rms ? (double)(rb * 1000) / rms : 0);
+        util_bytes_to_user(es, eb);
+        util_bytes_to_userf(ers, ems ? (double)(eb * 1000) / ems : 0);
+
+        printf("\nStress test complete: %" PRIuMAX " iterations in %u ms\n",
+               iters, elapsed_ms);
+        printf("  Written: %s @ %s/s\n", ws, wrs);
+        printf("  Read:    %s @ %s/s\n", rs, rrs);
+        printf("  Erased:  %s @ %s/s\n", es, ers);
+        printf("  Write errors: %" PRIuMAX "\n", we);
+        printf("  Read errors:  %" PRIuMAX "\n", re);
+        printf("  Erase errors: %" PRIuMAX "\n", ee);
+        retval = (re || we || ee) ? -1 : 0;
+    }
 
 done:
-    free(block_seeds);
-    free(block_buf);
-    free(expected_buf);
+    pthread_mutex_destroy(&shared.lock);
+    free(shared.block_seeds);
+    free(shared.inuse);
     if (mtd)
         mtd_dispose(mtd);
     return retval;
