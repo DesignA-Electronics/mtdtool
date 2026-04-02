@@ -15,10 +15,10 @@ jobs:
         run: |
           curl -LO https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
           tar -xf zig-x86_64-linux-0.15.2.tar.xz
-          export PATH="$PWD/zig-x86_64-linux-0.15.2:$PATH"
 
       - name: Build mtdtool for ARM32 (musl)
         run: |
+          export PATH="$PWD/zig-x86_64-linux-0.15.2:$PATH"
           make mtdtool \
             CC="zig cc -target arm-linux-musleabihf" \
             CLANG_FORMAT=true \
